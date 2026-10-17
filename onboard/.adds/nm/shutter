@@ -1,0 +1,6 @@
+# AB Shutter 3 -> page turn (Kobo) / SSH for debugging
+menu_item : main : Start shutter : cmd_spawn : quiet : kill -0 $(cat /tmp/shutter_remap.pid 2>/dev/null) 2>/dev/null || { /mnt/onboard/.adds/koreader/luajit /mnt/onboard/.adds/shutter/shutter_remap.lua > /tmp/shutter_remap.log 2>&1 & echo $! > /tmp/shutter_remap.pid; }
+menu_item : main : Stop shutter : cmd_spawn : quiet : kill $(cat /tmp/shutter_remap.pid) ; rm -f /tmp/shutter_remap.pid
+menu_item : main : Start SSH : cmd_spawn : quiet : mkdir -p /dev/pts; grep -q devpts /proc/mounts || mount -t devpts devpts /dev/pts; cd /mnt/onboard/.adds/koreader && [ ! -e /tmp/dropbear_koreader.pid ] && ./dropbear -E -R -s -p 2222 -P /tmp/dropbear_koreader.pid
+  chain_always : cmd_output : 2000 : echo "SSH port 2222"; ip -4 addr show wlan0 | grep inet
+menu_item : main : Stop SSH : cmd_spawn : quiet : kill $(cat /tmp/dropbear_koreader.pid) ; rm -f /tmp/dropbear_koreader.pid
