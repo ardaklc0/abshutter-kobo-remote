@@ -74,7 +74,9 @@ KOReader açılırken Nickel'i kapatır, Sage gibi cihazlarda Bluetooth'u da kap
 **Otomatik bağlanma** açıkken her şey kendiliğinden olur:
 
 - **Açılışta ve uyanınca** eklenti Bluetooth'u kurar. Uyku `hciattach`'ı öldürebildiği için uyanışta bağlantı her zaman baştan kurulur. Shutter yaklaşık 15 saniyede bağlanır ve ekranda "Shutter connected" bildirimi çıkar.
-- **Bekçi**, dakikada bir kontrol eder ve Bluetooth kapalıysa, örneğin bir kurulum başarısız olduysa, yeniden kurar. Menüden Bluetooth'u kapatırsan, tekrar açana kadar devreye girmez.
+- **Bekçi** dakikada bir kontrol eder. Bluetooth kapalıysa, örneğin bir kurulum başarısız olduysa, yeniden kurar. Shutter kopmuşsa yeniden bağlar; BlueZ'de üst üste 3 başarısız kontrolden sonra `bluetoothd`'yi yeniden başlatır. Menüden Bluetooth'u kapatırsan, tekrar açana kadar devreye girmez.
+- **Bluetooth** tik'i, Bluetooth'un açık olmasının istenip istenmediğini gösterir. Kurulum sürerken satırda "Bluetooth (turning on…)" yazar.
+- Bütün AB Shutter 3'ler aynı adı taşır. Eklenti o an eşleşmiş olanı kullanır, bağlı olanı tercih eder. Bu yüzden farklı bir shutter eşleştirmek ek ayar gerektirmez.
 - Her kurulum nedeniyle birlikte (`start`, `resume`, `watchdog`, `menu`) `/tmp/shutter_bt.log` dosyasına yazılır.
 
 KOReader aygıtları yalnızca açılışta tarıyor. Program KOReader'dan sonra başlarsa eklenti sanal aygıtı `Device.input:open()` ile kendisi açıyor.

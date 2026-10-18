@@ -35,6 +35,10 @@ local BT_LOCK = "/tmp/shutter_bt.lock"
 -- A bring-up takes ~15 s and can retry, so the first check waits for it.
 local WATCHDOG_FIRST_S = 90
 local WATCHDOG_EVERY_S = 60
+-- Consecutive checks without the shutter before bluetoothd is restarted.
+local RESTART_AFTER_MISSES = 3
+-- How often to look up which paired device is the shutter again.
+local SHUTTER_RECHECK_S = 30
 -- How long to keep watching for the shutter after a bring-up, to announce it.
 local ANNOUNCE_WITHIN_S = 150
 
@@ -79,6 +83,10 @@ function MTK:bringUpCmd(_force, device)
     return cmd
 end
 
+function MTK:reconnectCmd(device, _restart)
+    return self:dbusCmd(device, "org.bluez.Device1.Connect")
+end
+
 function MTK:powerOffCmd()
     return self:setPoweredCmd(false)
 end
@@ -100,6 +108,17 @@ end
 
 function BLUEZ:available()
     return self:chipPowered() and isRunning("bluetoothd") and fileExists("/sys/class/bluetooth/hci0")
+end
+
+-- BlueZ sometimes stops reconnecting the shutter after it drops, while a fresh
+-- bluetoothd always picks it back up, so restart bluetoothd when asked.
+function BLUEZ:reconnectCmd(device, restart)
+    local cmd = self:dbusCmd(device, "org.bluez.Device1.Connect")
+    if restart then
+        cmd = "killall -q bluetoothd; sleep 1; " .. self.bluetoothd .. " & sleep 3; "
+            .. self:setPoweredCmd(true) .. "; sleep 2; " .. cmd
+    end
+    return cmd
 end
 
 -- Suspend can kill hciattach, so a resume always rebuilds (force).
@@ -159,11 +178,23 @@ function Shutter:init()
     UIManager:scheduleIn(WATCHDOG_FIRST_S, self.watchdog)
 end
 
--- A bring-up can fail (e.g. while KOReader is restarting Wi-Fi on the same chip) and
--- suspend can take the stack down, so keep checking and rebuild it when it's gone.
+-- A bring-up can fail (e.g. while KOReader is restarting Wi-Fi on the same chip),
+-- suspend can take the stack down, and the shutter can drop and not come back, so
+-- keep checking: rebuild Bluetooth when it's gone, and reconnect a missing shutter,
+-- restarting bluetoothd when plain reconnects keep failing.
 function Shutter:checkBluetooth()
-    if self.bt_wanted and not self.bt:available() and not fileExists(BT_LOCK) then
-        self:bringUp(false, "watchdog")
+    if self.bt_wanted and not fileExists(BT_LOCK) then
+        local device = self:shutterPath()
+        if not self.bt:available() then
+            self.missed_checks = 0
+            self:bringUp(false, "watchdog")
+        elseif device and not self:isConnected() then
+            self.missed_checks = (self.missed_checks or 0) + 1
+            local restart = self.missed_checks % RESTART_AFTER_MISSES == 0
+            runAsync(self.bt:reconnectCmd(device, restart), restart and "reconnect+restart" or "reconnect")
+        else
+            self.missed_checks = 0
+        end
     end
     UIManager:scheduleIn(WATCHDOG_EVERY_S, self.watchdog)
 end
@@ -179,21 +210,42 @@ function Shutter:isPowered()
     return self.bt:getBool(ADAPTER, "org.bluez.Adapter1", "Powered")
 end
 
--- Device objects vanish while the adapter is off, so remember the shutter's path once found.
-function Shutter:shutterPath()
-    local cached = G_reader_settings:readSetting("shutter_bt_path")
-    if cached then return cached end
-    if not self.bt:available() then return end
+-- Finds the paired shutter, preferring a connected one. Every AB Shutter 3 has the
+-- same name and the old pairing can linger after pairing a new one, so the name
+-- alone isn't enough.
+function Shutter:findShutter()
     local xml = run(self.bt:dbusCmd(ADAPTER, "org.freedesktop.DBus.Introspectable.Introspect"))
+    local paired
     for node in xml:gmatch('node name="(dev_[%x_]+)"') do
         local path = ADAPTER .. "/" .. node
-        local name = run(self.bt:dbusCmd(path, "org.freedesktop.DBus.Properties.Get",
-            "string:org.bluez.Device1", "string:Name")):match('string "(.-)"')
-        if name == SHUTTER_NAME then
-            G_reader_settings:saveSetting("shutter_bt_path", path)
-            return path
+        local props = run(self.bt:dbusCmd(path, "org.freedesktop.DBus.Properties.GetAll", "string:org.bluez.Device1"))
+        if props:match('"Name"%s+variant%s+string "(.-)"') == SHUTTER_NAME
+                and props:match('"Paired"%s+variant%s+boolean (%a+)') == "true" then
+            if props:match('"Connected"%s+variant%s+boolean (%a+)') == "true" then
+                return path
+            end
+            paired = paired or path
         end
     end
+    return paired
+end
+
+-- Device objects vanish while the adapter is off, so the last shutter found is kept in
+-- the settings; while Bluetooth is up it's looked up again now and then, so pairing a
+-- different shutter is picked up.
+function Shutter:shutterPath()
+    if self.bt:available() and os.time() - (self.shutter_checked_at or 0) >= SHUTTER_RECHECK_S then
+        self.shutter_checked_at = os.time()
+        local found = self:findShutter()
+        if found ~= G_reader_settings:readSetting("shutter_bt_path") then
+            if found then
+                G_reader_settings:saveSetting("shutter_bt_path", found)
+            else
+                G_reader_settings:delSetting("shutter_bt_path")
+            end
+        end
+    end
+    return G_reader_settings:readSetting("shutter_bt_path")
 end
 
 function Shutter:isConnected()
@@ -290,23 +342,42 @@ function Shutter:onResume()
     end
 end
 
+-- Keep an open menu's Bluetooth and shutter lines current while a bring-up runs.
+function Shutter:refreshUntilReady(touchmenu_instance)
+    local deadline = os.time() + ANNOUNCE_WITHIN_S
+    local function refresh()
+        -- The menu may have been closed meanwhile; that's fine, just stop.
+        if not pcall(touchmenu_instance.updateItems, touchmenu_instance) then return end
+        if not self:isConnected() and os.time() < deadline then
+            UIManager:scheduleIn(3, refresh)
+        end
+    end
+    UIManager:scheduleIn(3, refresh)
+end
+
 function Shutter:addToMainMenu(menu_items)
     local bt_items = {}
     if self.bt then
         bt_items = {
             {
-                text = _("Bluetooth"),
-                checked_func = function() return self:isPowered() end,
+                -- The tick shows whether Bluetooth is meant to be on (auto-connect turns it
+                -- on at start); a bring-up takes a while, so say when it isn't ready yet.
+                text_func = function()
+                    if self.bt_wanted and not self:isPowered() then
+                        return _("Bluetooth (turning on…)")
+                    end
+                    return _("Bluetooth")
+                end,
+                checked_func = function() return self.bt_wanted end,
                 callback = function(touchmenu_instance)
-                    if self:isPowered() then
+                    if self.bt_wanted then
                         self.bt_wanted = false
                         self:powerOff()
                         touchmenu_instance:updateItems()
                     else
                         self.bt_wanted = true
                         self:bringUp(false, "menu")
-                        UIManager:show(InfoMessage:new{ text = _("Turning Bluetooth on…"), timeout = 3 })
-                        UIManager:scheduleIn(8, function() touchmenu_instance:updateItems() end)
+                        self:refreshUntilReady(touchmenu_instance)
                     end
                 end,
             },
@@ -326,7 +397,7 @@ function Shutter:addToMainMenu(menu_items)
                         text = _("Connecting… If it doesn't connect, press a shutter button once."),
                         timeout = 4,
                     })
-                    UIManager:scheduleIn(8, function() touchmenu_instance:updateItems() end)
+                    self:refreshUntilReady(touchmenu_instance)
                 end,
             },
         }

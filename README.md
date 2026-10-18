@@ -75,7 +75,9 @@ KOReader stops Nickel when it starts, and on devices like the Sage it also shuts
 Everything is automatic while **Auto-connect** is on:
 
 - **On start and on wake**, the plugin brings Bluetooth up. Sleep can kill `hciattach`, so a wake always rebuilds the link. The shutter reconnects in about 15 seconds, and a "Shutter connected" notification appears.
-- **A watchdog** checks every minute and rebuilds Bluetooth if it's down, for example when a bring-up failed. Turning Bluetooth off from the menu stops it until you turn Bluetooth back on.
+- **A watchdog** checks every minute. It rebuilds Bluetooth if it's down, for example when a bring-up failed, and reconnects the shutter if it dropped; on BlueZ it restarts `bluetoothd` after 3 failed checks in a row. Turning Bluetooth off from the menu stops it until you turn Bluetooth back on.
+- The **Bluetooth** tick shows whether Bluetooth is meant to be on; while a bring-up is still running the line reads "Bluetooth (turning on…)".
+- Every AB Shutter 3 has the same name. The plugin uses whichever one is currently paired (preferring a connected one), so pairing a different shutter just works.
 - Every bring-up is logged to `/tmp/shutter_bt.log` with the reason (`start`, `resume`, `watchdog`, `menu`).
 
 KOReader scans input devices only at startup. If the remapper starts after KOReader, the plugin opens the virtual device itself with `Device.input:open()`.
