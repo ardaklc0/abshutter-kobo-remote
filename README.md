@@ -60,7 +60,7 @@ Adds a **Network → Bluetooth & Shutter** menu:
 
 KOReader stops Nickel when it starts, and on devices like the Sage it also shuts Bluetooth down. The plugin manages Bluetooth without Nickel:
 
-- **MediaTek devices (Clara BW/Colour):** Kobo's `mtkbtd` service keeps running under KOReader. The plugin powers the adapter and connects the shutter over D-Bus (`com.kobo.mtk.bluedroid`, which exposes BlueZ-compatible `org.bluez.Adapter1`/`Device1` interfaces).
+- **MediaTek devices (Clara BW/Colour):** Kobo's `mtkbtd` service keeps running under KOReader and is driven over D-Bus (`com.kobo.mtk.bluedroid`, which exposes BlueZ-compatible `org.bluez.Adapter1`/`Device1` interfaces). The plugin never calls `Device1.Connect` there: when the shutter doesn't answer, that call blocks the whole service until it gives up, and every other call times out meanwhile. Instead it power-cycles the adapter, which makes `mtkbtd` scan for its paired devices and reconnect the shutter by itself, in about 10 seconds. After a wake `mtkbtd` is busy for a while and also gets reset when KOReader restores Wi-Fi (Wi-Fi and Bluetooth share one chip), so the plugin waits for it to answer before acting.
 - **BlueZ devices (Sage):** at startup, `koreader.sh` cuts power to the chip (`rfkill` + `ntx_io 126 0`) and kills `bluetoothd`. Nickel's `hciattach` keeps running, though, so `hci0` still exists even though the chip is off. The plugin:
   1. Kills the stale `hciattach`.
   2. Powers the chip back on (`ntx_io 126 1`, `rfkill` = 1).
@@ -74,8 +74,8 @@ KOReader stops Nickel when it starts, and on devices like the Sage it also shuts
 
 Everything is automatic while **Auto-connect** is on:
 
-- **On start and on wake**, the plugin brings Bluetooth up. Sleep can kill `hciattach`, so a wake always rebuilds the link. The shutter reconnects in about 15 seconds, and a "Shutter connected" notification appears.
-- **A watchdog** checks every minute. It rebuilds Bluetooth if it's down, for example when a bring-up failed, and reconnects the shutter if it dropped; on BlueZ it restarts `bluetoothd` after 3 failed checks in a row. Turning Bluetooth off from the menu stops it until you turn Bluetooth back on.
+- **On start and on wake**, the plugin brings Bluetooth up. On BlueZ, sleep can kill `hciattach`, so a wake always rebuilds the link. A "Shutter connected" notification appears when it's ready. Measured from wake to connected: about **15 s on the Sage** and about **35-40 s on the Clara**, where `mtkbtd` only starts looking for the shutter that long after a wake, whatever the plugin does. On start, after a disconnect or from the menu it takes about 10 s on both.
+- **Follow-up checks and a watchdog.** For 2.5 minutes after start or wake the plugin checks every 20 s, and after that a watchdog checks every minute. If the adapter is off it turns it on; if the shutter is missing it reconnects it (after 2 failed watchdog checks on BlueZ it restarts `bluetoothd`). Tapping the shutter line in the menu does the strongest reconnect right away. Turning Bluetooth off from the menu stops all of this until you turn Bluetooth back on.
 - The **Bluetooth** tick shows whether Bluetooth is meant to be on; while a bring-up is still running the line reads "Bluetooth (turning on…)".
 - Every AB Shutter 3 has the same name. The plugin uses whichever one is currently paired (preferring a connected one), so pairing a different shutter just works.
 - Every bring-up is logged to `/tmp/shutter_bt.log` with the reason (`start`, `resume`, `watchdog`, `menu`).

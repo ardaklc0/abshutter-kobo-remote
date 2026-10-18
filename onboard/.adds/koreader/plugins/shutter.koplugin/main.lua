@@ -36,7 +36,17 @@ local BT_LOCK = "/tmp/shutter_bt.lock"
 local WATCHDOG_FIRST_S = 90
 local WATCHDOG_EVERY_S = 60
 -- Consecutive checks without the shutter before bluetoothd is restarted.
-local RESTART_AFTER_MISSES = 3
+local RESTART_AFTER_MISSES = 2
+-- After a start or wake bring-up, check again after this long...
+local FOLLOW_UP_S = 20
+-- ...then repeat this often...
+local FOLLOW_UP_EVERY_S = 20
+-- ...for this long.
+local FOLLOW_UP_FOR_S = 150
+-- A "start" within this long of another bring-up is a duplicate.
+local RECENT_BRINGUP_S = 60
+-- Shared by the file manager's and the reader's plugin instances.
+local last_bringup = 0
 -- How often to look up which paired device is the shutter again.
 local SHUTTER_RECHECK_S = 30
 -- How long to keep watching for the shutter after a bring-up, to announce it.
@@ -71,20 +81,36 @@ end
 
 local MTK = {
     dest = "com.kobo.mtk.bluedroid",
+    -- mtkbtd is busy for a while after a wake (each call takes ~5 s and it only starts
+    -- looking for the shutter ~35 s in, whatever we do), so don't rush it.
+    resume_delay = 8,
 }
 
 function MTK:available() return true end
 
-function MTK:bringUpCmd(_force, device)
-    local cmd = self:setPoweredCmd(true)
-    if device then
-        cmd = cmd .. "; sleep 3; " .. self:dbusCmd(device, "org.bluez.Device1.Connect")
-    end
-    return cmd
+-- mtkbtd restarts on wake and doesn't answer for a while (commands sent meanwhile are
+-- lost), and comes back with the adapter off, so wait until it answers first.
+function MTK:waitReadyCmd()
+    return "i=0; until dbus-send --system --print-reply --reply-timeout=2000 --dest=" .. self.dest
+        .. " " .. ADAPTER .. " org.freedesktop.DBus.Properties.Get string:org.bluez.Adapter1 string:Powered"
+        .. " >/dev/null 2>&1 || [ $i -ge 20 ]; do sleep 1; i=$((i+1)); done; echo \"mtkbtd ready after ${i}s\""
 end
 
-function MTK:reconnectCmd(device, _restart)
-    return self:dbusCmd(device, "org.bluez.Device1.Connect")
+-- mtkbtd's Device1.Connect blocks the whole service until it gives up when the shutter
+-- doesn't answer (asleep, or right after a wake), and every other call times out
+-- meanwhile. Power-cycling the adapter instead makes mtkbtd scan for its paired
+-- devices and reconnect the shutter by itself, within ~5 s when it's awake. So on
+-- MediaTek, bringing up and reconnecting are both just a power-cycle, never Connect.
+function MTK:powerCycleCmd()
+    return self:waitReadyCmd() .. "; " .. self:setPoweredCmd(false) .. "; sleep 2; " .. self:setPoweredCmd(true)
+end
+
+function MTK:bringUpCmd(_force, _device)
+    return self:powerCycleCmd()
+end
+
+function MTK:reconnectCmd(_device, _restart)
+    return self:powerCycleCmd()
 end
 
 function MTK:powerOffCmd()
@@ -93,6 +119,7 @@ end
 
 local BLUEZ = {
     dest = "org.bluez",
+    resume_delay = 2,
     rfkill = "/sys/devices/platform/bt/rfkill/rfkill0/state",
     bluetoothd = "/libexec/bluetooth/bluetoothd",
     -- Rebuilds the UART link with retries and a lock; see the comments in the script.
@@ -142,6 +169,12 @@ for _i, backend in ipairs({MTK, BLUEZ}) do
             self.dest, path, method, table.concat({...}, " "))
     end
 
+    -- Status queries run on the UI thread, so don't let a busy or restarting
+    -- Bluetooth service stall page turns for long.
+    function backend:queryCmd(path, method, ...)
+        return (self:dbusCmd(path, method, ...):gsub("reply%-timeout=5000", "reply-timeout=1500"))
+    end
+
     function backend:setPoweredCmd(on)
         return self:dbusCmd(ADAPTER, "org.freedesktop.DBus.Properties.Set", "string:org.bluez.Adapter1",
             "string:Powered", "variant:boolean:" .. tostring(on))
@@ -149,7 +182,7 @@ for _i, backend in ipairs({MTK, BLUEZ}) do
 
     function backend:getBool(path, iface, prop)
         if not self:available() then return false end
-        local out = run(self:dbusCmd(path, "org.freedesktop.DBus.Properties.Get", "string:" .. iface, "string:" .. prop))
+        local out = run(self:queryCmd(path, "org.freedesktop.DBus.Properties.Get", "string:" .. iface, "string:" .. prop))
         return out:match("boolean (%a+)") == "true"
     end
 end
@@ -183,9 +216,11 @@ end
 -- keep checking: rebuild Bluetooth when it's gone, and reconnect a missing shutter,
 -- restarting bluetoothd when plain reconnects keep failing.
 function Shutter:checkBluetooth()
+    logger.dbg("Shutter: watchdog check, wanted:", self.bt_wanted)
     if self.bt_wanted and not fileExists(BT_LOCK) then
         local device = self:shutterPath()
-        if not self.bt:available() then
+        -- The adapter can also come back switched off (mtkbtd restarts on wake).
+        if not self.bt:available() or not self:isPowered() then
             self.missed_checks = 0
             self:bringUp(false, "watchdog")
         elseif device and not self:isConnected() then
@@ -202,6 +237,7 @@ end
 function Shutter:onCloseWidget()
     UIManager:unschedule(self.watchdog)
     UIManager:unschedule(self.connection_poll)
+    UIManager:unschedule(self.follow_up)
 end
 
 -- Bluetooth
@@ -214,11 +250,11 @@ end
 -- same name and the old pairing can linger after pairing a new one, so the name
 -- alone isn't enough.
 function Shutter:findShutter()
-    local xml = run(self.bt:dbusCmd(ADAPTER, "org.freedesktop.DBus.Introspectable.Introspect"))
+    local xml = run(self.bt:queryCmd(ADAPTER, "org.freedesktop.DBus.Introspectable.Introspect"))
     local paired
     for node in xml:gmatch('node name="(dev_[%x_]+)"') do
         local path = ADAPTER .. "/" .. node
-        local props = run(self.bt:dbusCmd(path, "org.freedesktop.DBus.Properties.GetAll", "string:org.bluez.Device1"))
+        local props = run(self.bt:queryCmd(path, "org.freedesktop.DBus.Properties.GetAll", "string:org.bluez.Device1"))
         if props:match('"Name"%s+variant%s+string "(.-)"') == SHUTTER_NAME
                 and props:match('"Paired"%s+variant%s+boolean (%a+)') == "true" then
             if props:match('"Connected"%s+variant%s+boolean (%a+)') == "true" then
@@ -234,15 +270,15 @@ end
 -- the settings; while Bluetooth is up it's looked up again now and then, so pairing a
 -- different shutter is picked up.
 function Shutter:shutterPath()
-    if self.bt:available() and os.time() - (self.shutter_checked_at or 0) >= SHUTTER_RECHECK_S then
+    -- Only look while the adapter is on: while it's off (or mtkbtd is restarting) the
+    -- device objects are gone, which says nothing about the pairing, so never forget
+    -- the saved shutter because of that.
+    if os.time() - (self.shutter_checked_at or 0) >= SHUTTER_RECHECK_S
+            and self.bt:available() and self:isPowered() then
         self.shutter_checked_at = os.time()
         local found = self:findShutter()
-        if found ~= G_reader_settings:readSetting("shutter_bt_path") then
-            if found then
-                G_reader_settings:saveSetting("shutter_bt_path", found)
-            else
-                G_reader_settings:delSetting("shutter_bt_path")
-            end
+        if found and found ~= G_reader_settings:readSetting("shutter_bt_path") then
+            G_reader_settings:saveSetting("shutter_bt_path", found)
         end
     end
     return G_reader_settings:readSetting("shutter_bt_path")
@@ -255,7 +291,51 @@ end
 
 -- Power on and connect in the background; bringing the stack up can take several seconds.
 function Shutter:bringUp(force, reason)
+    -- Opening a book right after start or wake creates a second plugin instance; don't
+    -- run a second bring-up, but take over the follow-up check, since the file
+    -- manager's instance cancels its own when it closes.
+    if reason == "start" and os.time() - last_bringup < RECENT_BRINGUP_S then
+        self:scheduleFollowUp(reason)
+        return
+    end
+    last_bringup = os.time()
     runAsync(self.bt:bringUpCmd(force, self:shutterPath()), reason)
+    self:announceConnection()
+    if reason == "start" or reason == "resume" then
+        self:scheduleFollowUp(reason)
+    end
+end
+
+-- A plain connect often isn't enough after start or wake (the Bluetooth service can be
+-- stuck on an old attempt), so if the shutter still isn't there shortly after, force
+-- the reconnect that a menu tap would do instead of waiting for the watchdog.
+-- On the Clara, KOReader restoring Wi-Fi after a wake resets the shared Wi-Fi/Bluetooth
+-- chip, which kills the Bluetooth service ~35 s later; it comes back with the adapter
+-- off. So keep checking for a couple of minutes and repair whatever is missing.
+function Shutter:scheduleFollowUp(reason)
+    UIManager:unschedule(self.follow_up)
+    local deadline = os.time() + FOLLOW_UP_FOR_S
+    local forced = false
+    self.follow_up = function()
+        logger.info("Shutter: follow-up check", reason, "wanted:", self.bt_wanted)
+        if not self.bt_wanted then return end
+        if not fileExists(BT_LOCK) then -- otherwise a BlueZ bring-up is still running
+            local device = self:shutterPath()
+            if not self.bt:available() or not self:isPowered() then
+                runAsync(self.bt:bringUpCmd(false, device), reason .. " follow-up: power on")
+            elseif device and not self:isConnected() then
+                -- First a plain connect; if that didn't do it, the stronger restart.
+                runAsync(self.bt:reconnectCmd(device, forced), reason .. " follow-up: reconnect")
+                forced = not forced
+            elseif device then
+                return -- connected
+            end
+        end
+        if os.time() < deadline then
+            UIManager:scheduleIn(FOLLOW_UP_EVERY_S, self.follow_up)
+        end
+    end
+    UIManager:scheduleIn(FOLLOW_UP_S, self.follow_up)
     self:announceConnection()
 end
 
@@ -336,9 +416,10 @@ function Shutter:setRemapping(on)
 end
 
 function Shutter:onResume()
+    logger.info("Shutter: resume, wanted:", self.bt_wanted)
     if self.bt_wanted then
         -- Give the Bluetooth firmware a moment after wakeup.
-        UIManager:scheduleIn(2, function() self:bringUp(true, "resume") end)
+        UIManager:scheduleIn(self.bt.resume_delay, function() self:bringUp(true, "resume") end)
     end
 end
 
@@ -392,7 +473,15 @@ function Shutter:addToMainMenu(menu_items)
                 enabled_func = function() return self:shutterPath() ~= nil end,
                 callback = function(touchmenu_instance)
                     self.bt_wanted = true
-                    self:bringUp(false, "menu")
+                    -- A tap is the user saying it's stuck, so use the strongest fix:
+                    -- reconnect with an adapter/bluetoothd restart, or a full bring-up.
+                    local device = self:shutterPath()
+                    if device and self.bt:available() then
+                        runAsync(self.bt:reconnectCmd(device, true), "menu reconnect")
+                        self:announceConnection()
+                    else
+                        self:bringUp(false, "menu")
+                    end
                     UIManager:show(InfoMessage:new{
                         text = _("Connecting… If it doesn't connect, press a shutter button once."),
                         timeout = 4,

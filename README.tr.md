@@ -59,7 +59,7 @@ KOReader'ın içinde gelen LuaJIT ile çalışan küçük bir program:
 
 KOReader açılırken Nickel'i kapatır, Sage gibi cihazlarda Bluetooth'u da kapatır. Eklenti Bluetooth'u Nickel olmadan yönetir:
 
-- **MediaTek cihazlar (Clara BW/Colour):** Kobo'nun `mtkbtd` servisi KOReader açıkken de çalışmaya devam ediyor. Eklenti D-Bus üzerinden (`com.kobo.mtk.bluedroid`, BlueZ uyumlu `org.bluez.Adapter1`/`Device1` arayüzü) adaptörü açıp kapatıyor ve shutter'ı bağlıyor.
+- **MediaTek cihazlar (Clara BW/Colour):** Kobo'nun `mtkbtd` servisi KOReader açıkken de çalışmaya devam ediyor ve D-Bus üzerinden yönetiliyor (`com.kobo.mtk.bluedroid`, BlueZ uyumlu `org.bluez.Adapter1`/`Device1` arayüzü). Eklenti orada `Device1.Connect` hiç çağırmıyor: shutter cevap vermediğinde bu çağrı, vazgeçene kadar bütün servisi kilitliyor ve o sırada diğer bütün çağrılar zaman aşımına uğruyor. Onun yerine adaptörü kapatıp açıyor; `mtkbtd` bunun üzerine eşleşmiş cihazlarını tarıyor ve shutter'ı ~10 saniyede kendisi bağlıyor. Uyanıştan sonra `mtkbtd` bir süre meşgul oluyor, KOReader Wi-Fi'ı geri açınca da sıfırlanıyor (Wi-Fi ve Bluetooth aynı çipte). Eklenti bu yüzden bir şey yapmadan önce servisin cevap vermesini bekliyor.
 - **BlueZ cihazlar (Sage):** `koreader.sh` açılışta çipin gücünü kesiyor (`rfkill` + `ntx_io 126 0`) ve `bluetoothd`'yi kapatıyor. Nickel'in başlattığı `hciattach` ise çalışmaya devam ediyor, yani `hci0` var görünse de çip kapalı oluyor. Eklenti şu sırayı izliyor:
   1. Eski `hciattach`'ı kapatır.
   2. Çipe güç verir (`ntx_io 126 1`, `rfkill`=1).
@@ -73,8 +73,8 @@ KOReader açılırken Nickel'i kapatır, Sage gibi cihazlarda Bluetooth'u da kap
 
 **Otomatik bağlanma** açıkken her şey kendiliğinden olur:
 
-- **Açılışta ve uyanınca** eklenti Bluetooth'u kurar. Uyku `hciattach`'ı öldürebildiği için uyanışta bağlantı her zaman baştan kurulur. Shutter yaklaşık 15 saniyede bağlanır ve ekranda "Shutter connected" bildirimi çıkar.
-- **Bekçi** dakikada bir kontrol eder. Bluetooth kapalıysa, örneğin bir kurulum başarısız olduysa, yeniden kurar. Shutter kopmuşsa yeniden bağlar; BlueZ'de üst üste 3 başarısız kontrolden sonra `bluetoothd`'yi yeniden başlatır. Menüden Bluetooth'u kapatırsan, tekrar açana kadar devreye girmez.
+- **Açılışta ve uyanınca** eklenti Bluetooth'u kurar. BlueZ'de uyku `hciattach`'ı öldürebildiği için uyanışta bağlantı her zaman baştan kurulur. Hazır olunca ekranda "Shutter connected" bildirimi çıkar. Uyanıştan bağlanmaya ölçülen süre: **Sage'de ~15 sn**, **Clara'da ~35-40 sn**. Clara'da `mtkbtd`, eklenti ne yaparsa yapsın, shutter'ı ancak uyanıştan o kadar sonra aramaya başlıyor. Açılışta, kopmadan sonra ve menüden ikisinde de ~10 saniye sürer.
+- **Ara kontroller ve bekçi.** Açılış ya da uyanıştan sonraki 2,5 dakika boyunca eklenti 20 saniyede bir kontrol eder, sonra bekçi dakikada bir kontrol eder. Adaptör kapalıysa açar, shutter yoksa yeniden bağlar (BlueZ'de bekçinin üst üste 2 başarısız kontrolünden sonra `bluetoothd`'yi yeniden başlatır). Menüde shutter satırına dokunmak en güçlü yeniden bağlamayı hemen yapar. Menüden Bluetooth'u kapatırsan, tekrar açana kadar bunların hiçbiri devreye girmez.
 - **Bluetooth** tik'i, Bluetooth'un açık olmasının istenip istenmediğini gösterir. Kurulum sürerken satırda "Bluetooth (turning on…)" yazar.
 - Bütün AB Shutter 3'ler aynı adı taşır. Eklenti o an eşleşmiş olanı kullanır, bağlı olanı tercih eder. Bu yüzden farklı bir shutter eşleştirmek ek ayar gerektirmez.
 - Her kurulum nedeniyle birlikte (`start`, `resume`, `watchdog`, `menu`) `/tmp/shutter_bt.log` dosyasına yazılır.
