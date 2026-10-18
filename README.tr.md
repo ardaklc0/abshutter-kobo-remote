@@ -67,7 +67,15 @@ KOReader açılırken Nickel'i kapatır, Sage gibi cihazlarda Bluetooth'u da kap
   4. `bluetoothd`'yi arka planda çalıştırır.
   5. Adaptörü açıp shutter'ı bağlar.
 
+  Bu sıra `bluez_up.sh` betiğinde. `hciattach` yeniden başlatıldıktan sonra çip komutlara cevap veriyor ama sıfırlanana kadar (`hciconfig hci0 reset`) düşük enerjili tarama yapamıyor. Betik bu yüzden çipi sıfırlıyor; sıfırlamadan shutter hiç görünmüyor. Aynı çip Wi-Fi'ı da yönetiyor ve KOReader çoğu zaman tam o sırada Wi-Fi'ı açıyor. Betik bu yüzden çipin gücünü uzun beklemelerle kapatıp açıyor ve en fazla 3 kez yeniden deniyor. Bir kilit, eklentinin iki kopyasının (dosya yöneticisi ve okuyucu) çipe aynı anda dokunmasını önlüyor.
+
   Eşleşme bilgileri kalıcı olarak `/var/db/bluetooth` altında durduğu için yeniden eşleştirme gerekmiyor.
+
+**Otomatik bağlanma** açıkken her şey kendiliğinden olur:
+
+- **Açılışta ve uyanınca** eklenti Bluetooth'u kurar. Uyku `hciattach`'ı öldürebildiği için uyanışta bağlantı her zaman baştan kurulur. Shutter yaklaşık 15 saniyede bağlanır ve ekranda "Shutter connected" bildirimi çıkar.
+- **Bekçi**, dakikada bir kontrol eder ve Bluetooth kapalıysa, örneğin bir kurulum başarısız olduysa, yeniden kurar. Menüden Bluetooth'u kapatırsan, tekrar açana kadar devreye girmez.
+- Her kurulum nedeniyle birlikte (`start`, `resume`, `watchdog`, `menu`) `/tmp/shutter_bt.log` dosyasına yazılır.
 
 KOReader aygıtları yalnızca açılışta tarıyor. Program KOReader'dan sonra başlarsa eklenti sanal aygıtı `Device.input:open()` ile kendisi açıyor.
 
@@ -94,7 +102,7 @@ KFMon, `/etc/init.d/on-animator.sh` dosyasını kendi sürümüyle değiştirere
 onboard/                                    → Kobo'nun USB depolama alanı (/mnt/onboard)
   .adds/shutter/shutter_remap.lua           Yeniden eşleme programı
   .adds/nm/shutter                          NickelMenu girişleri (Start/Stop shutter, Start/Stop SSH)
-  .adds/koreader/plugins/shutter.koplugin/  KOReader eklentisi
+  .adds/koreader/plugins/shutter.koplugin/  KOReader eklentisi (bluez_up.sh: BlueZ kurulumu)
   .adds/koreader/patches/2-shutter-pagekeys.lua   Yalnızca tuşsuz cihazlar (Clara) için
 rootfs/
   etc/init.d/on-animator-head.sh            /etc/init.d/on-animator.sh'ın başına eklenecek blok

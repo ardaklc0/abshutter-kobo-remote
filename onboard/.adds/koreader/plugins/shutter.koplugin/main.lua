@@ -3,11 +3,12 @@
 --   * MTK (Clara BW/Colour): Kobo's mtkbtd D-Bus service keeps running after KOReader
 --     kills Nickel, so we only toggle the adapter and connect.
 --   * BlueZ on sunxi (Sage): koreader.sh powers the chip down and kills bluetoothd,
---     so powering on rebuilds the stack the way Nickel does.
+--     so powering on rebuilds the stack the way Nickel does (bluez_up.sh).
 -- Page turns come from shutter_remap.lua, which turns the shutter's volume-up key
 -- into Kobo page-button codes on a uinput device.
 local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
+local Notification = require("ui/widget/notification")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local ffiutil = require("ffi/util")
@@ -27,6 +28,15 @@ local REMAP_PID = "/tmp/shutter_remap.pid"
 local REMAP_LOG = "/tmp/shutter_remap.log"
 local REMAP_PAUSED = "/tmp/shutter_remap.paused"
 local REMAP_DEVICE_NAME = "Shutter Remap"
+-- Output of Bluetooth bring-ups, for troubleshooting.
+local BT_LOG = "/tmp/shutter_bt.log"
+-- Held by bluez_up.sh while it works on the chip.
+local BT_LOCK = "/tmp/shutter_bt.lock"
+-- A bring-up takes ~15 s and can retry, so the first check waits for it.
+local WATCHDOG_FIRST_S = 90
+local WATCHDOG_EVERY_S = 60
+-- How long to keep watching for the shutter after a bring-up, to announce it.
+local ANNOUNCE_WITHIN_S = 150
 
 local function run(cmd)
     local p = io.popen(cmd .. " 2>/dev/null")
@@ -35,8 +45,12 @@ local function run(cmd)
     return out
 end
 
-local function runAsync(cmd)
-    os.execute("(" .. cmd .. ") >/dev/null 2>&1 &")
+-- Appends to BT_LOG under a header naming why it ran; the log is cut when it gets big.
+local function runAsync(cmd, reason)
+    os.execute(string.format(
+        "( [ \"$(wc -c < %s 2>/dev/null || echo 0)\" -gt 50000 ] && : > %s;"
+            .. " echo \"== $(date '+%%F %%T') %s\"; %s ) >> %s 2>&1 &",
+        BT_LOG, BT_LOG, reason or "", cmd, BT_LOG))
 end
 
 local function fileExists(path)
@@ -57,20 +71,24 @@ local MTK = {
 
 function MTK:available() return true end
 
-function MTK:powerOnCmd()
-    return self:setPoweredCmd(true)
+function MTK:bringUpCmd(_force, device)
+    local cmd = self:setPoweredCmd(true)
+    if device then
+        cmd = cmd .. "; sleep 3; " .. self:dbusCmd(device, "org.bluez.Device1.Connect")
+    end
+    return cmd
 end
 
 function MTK:powerOffCmd()
     return self:setPoweredCmd(false)
 end
 
--- Same sequence Nickel uses on sunxi; values taken from the running processes on a Sage.
 local BLUEZ = {
     dest = "org.bluez",
     rfkill = "/sys/devices/platform/bt/rfkill/rfkill0/state",
-    hciattach = "/sbin/hciattach -n /dev/ttyS1 bcm43xx 1500000 flow -t 20 -b bcm43xx_init",
     bluetoothd = "/libexec/bluetooth/bluetoothd",
+    -- Rebuilds the UART link with retries and a lock; see the comments in the script.
+    script = KOREADER_DIR .. "/plugins/shutter.koplugin/bluez_up.sh",
 }
 
 function BLUEZ:chipPowered()
@@ -84,23 +102,9 @@ function BLUEZ:available()
     return self:chipPowered() and isRunning("bluetoothd") and fileExists("/sys/class/bluetooth/hci0")
 end
 
--- koreader.sh cuts the chip's power but leaves Nickel's hciattach (and so hci0) around,
--- so the chip state, not hci0, decides whether the UART link has to be rebuilt.
-function BLUEZ:powerOnCmd()
-    return table.concat({
-        "cd " .. KOREADER_DIR,
-        "if [ \"$(cat " .. self.rfkill .. ")\" != 1 ] || ! pidof hciattach >/dev/null; then"
-            .. " killall -q bluetoothd hciattach; sleep 1;"
-            .. " ./luajit frontend/device/kobo/ntx_io.lua 126 1;"
-            .. " echo 1 > " .. self.rfkill .. "; sleep 1;"
-            .. " " .. self.hciattach .. " &"
-            .. " i=0; while [ ! -e /sys/class/bluetooth/hci0 ] && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done;"
-            .. " sleep 2;"
-            .. " fi",
-        -- bluetoothd stays in the foreground here.
-        "pidof bluetoothd >/dev/null || { " .. self.bluetoothd .. " & sleep 3; }",
-        self:setPoweredCmd(true),
-    }, "; ")
+-- Suspend can kill hciattach, so a resume always rebuilds (force).
+function BLUEZ:bringUpCmd(force, device)
+    return string.format("sh %s %s %s", self.script, force and "force" or "''", device or "")
 end
 
 -- Mirror koreader.sh: leave the chip powered down so it doesn't drain the battery.
@@ -146,9 +150,27 @@ function Shutter:init()
     self.autoconnect = G_reader_settings:nilOrTrue("shutter_autoconnect")
     self.ui.menu:registerToMainMenu(self)
     self:ensureRemap()
-    if self.bt and self.autoconnect then
-        self:bringUp()
+    -- Whether Bluetooth should be up; turning it off from the menu stops the watchdog.
+    self.bt_wanted = self.bt ~= nil and self.autoconnect
+    if self.bt_wanted then
+        self:bringUp(false, "start")
     end
+    self.watchdog = function() self:checkBluetooth() end
+    UIManager:scheduleIn(WATCHDOG_FIRST_S, self.watchdog)
+end
+
+-- A bring-up can fail (e.g. while KOReader is restarting Wi-Fi on the same chip) and
+-- suspend can take the stack down, so keep checking and rebuild it when it's gone.
+function Shutter:checkBluetooth()
+    if self.bt_wanted and not self.bt:available() and not fileExists(BT_LOCK) then
+        self:bringUp(false, "watchdog")
+    end
+    UIManager:scheduleIn(WATCHDOG_EVERY_S, self.watchdog)
+end
+
+function Shutter:onCloseWidget()
+    UIManager:unschedule(self.watchdog)
+    UIManager:unschedule(self.connection_poll)
 end
 
 -- Bluetooth
@@ -180,13 +202,24 @@ function Shutter:isConnected()
 end
 
 -- Power on and connect in the background; bringing the stack up can take several seconds.
-function Shutter:bringUp()
-    local cmd = self.bt:powerOnCmd()
-    local path = self:shutterPath()
-    if path then
-        cmd = cmd .. "; sleep 3; " .. self.bt:dbusCmd(path, "org.bluez.Device1.Connect")
+function Shutter:bringUp(force, reason)
+    runAsync(self.bt:bringUpCmd(force, self:shutterPath()), reason)
+    self:announceConnection()
+end
+
+-- Bring-ups run in the background and can take most of a minute, so tell the user
+-- when the shutter is actually ready.
+function Shutter:announceConnection()
+    UIManager:unschedule(self.connection_poll)
+    local deadline = os.time() + ANNOUNCE_WITHIN_S
+    self.connection_poll = function()
+        if self:isConnected() then
+            UIManager:show(Notification:new{ text = _("Shutter connected") })
+        elseif os.time() < deadline then
+            UIManager:scheduleIn(3, self.connection_poll)
+        end
     end
-    runAsync(cmd)
+    UIManager:scheduleIn(3, self.connection_poll)
 end
 
 function Shutter:powerOff()
@@ -251,9 +284,9 @@ function Shutter:setRemapping(on)
 end
 
 function Shutter:onResume()
-    if self.bt and self.autoconnect then
+    if self.bt_wanted then
         -- Give the Bluetooth firmware a moment after wakeup.
-        UIManager:scheduleIn(2, function() self:bringUp() end)
+        UIManager:scheduleIn(2, function() self:bringUp(true, "resume") end)
     end
 end
 
@@ -266,10 +299,12 @@ function Shutter:addToMainMenu(menu_items)
                 checked_func = function() return self:isPowered() end,
                 callback = function(touchmenu_instance)
                     if self:isPowered() then
+                        self.bt_wanted = false
                         self:powerOff()
                         touchmenu_instance:updateItems()
                     else
-                        self:bringUp()
+                        self.bt_wanted = true
+                        self:bringUp(false, "menu")
                         UIManager:show(InfoMessage:new{ text = _("Turning Bluetooth on…"), timeout = 3 })
                         UIManager:scheduleIn(8, function() touchmenu_instance:updateItems() end)
                     end
@@ -285,7 +320,8 @@ function Shutter:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 enabled_func = function() return self:shutterPath() ~= nil end,
                 callback = function(touchmenu_instance)
-                    self:bringUp()
+                    self.bt_wanted = true
+                    self:bringUp(false, "menu")
                     UIManager:show(InfoMessage:new{
                         text = _("Connecting… If it doesn't connect, press a shutter button once."),
                         timeout = 4,

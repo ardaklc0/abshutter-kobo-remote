@@ -68,7 +68,15 @@ KOReader stops Nickel when it starts, and on devices like the Sage it also shuts
   4. Starts `bluetoothd` in the background.
   5. Powers the adapter and connects the shutter.
 
+  This lives in `bluez_up.sh`. After `hciattach` restarts, the controller answers commands but can't run LE scans until it gets an HCI reset (`hciconfig hci0 reset`), so the script resets it; without that the shutter is never seen. The chip also handles Wi-Fi, which KOReader is often bringing up at the same moment, so the script power-cycles the chip with generous waits and retries up to 3 times. A lock keeps the two plugin instances (file manager and reader) from working on the chip at once.
+
   Pairings are stored persistently in `/var/db/bluetooth`, so there is no need to pair again.
+
+Everything is automatic while **Auto-connect** is on:
+
+- **On start and on wake**, the plugin brings Bluetooth up. Sleep can kill `hciattach`, so a wake always rebuilds the link. The shutter reconnects in about 15 seconds, and a "Shutter connected" notification appears.
+- **A watchdog** checks every minute and rebuilds Bluetooth if it's down, for example when a bring-up failed. Turning Bluetooth off from the menu stops it until you turn Bluetooth back on.
+- Every bring-up is logged to `/tmp/shutter_bt.log` with the reason (`start`, `resume`, `watchdog`, `menu`).
 
 KOReader scans input devices only at startup. If the remapper starts after KOReader, the plugin opens the virtual device itself with `Device.input:open()`.
 
@@ -95,7 +103,7 @@ A **Kobo firmware update** can restore the original `on-animator.sh`. KFMon not 
 onboard/                                    → Kobo's USB storage (/mnt/onboard)
   .adds/shutter/shutter_remap.lua           Remapper
   .adds/nm/shutter                          NickelMenu entries (start/stop shutter and SSH)
-  .adds/koreader/plugins/shutter.koplugin/  KOReader plugin
+  .adds/koreader/plugins/shutter.koplugin/  KOReader plugin (bluez_up.sh: BlueZ bring-up)
   .adds/koreader/patches/2-shutter-pagekeys.lua   Button-less devices (Clara) only
 rootfs/
   etc/init.d/on-animator-head.sh            Block to insert at the top of /etc/init.d/on-animator.sh
